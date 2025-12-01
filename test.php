@@ -1,0 +1,1 @@
+<?php echo 'variables_order=' . ini_get('variables_order') . PHP_EOL; echo 'disable_functions=' . ini_get('disable_functions') . PHP_EOL; ?>
