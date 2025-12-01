@@ -1,17 +1,13 @@
 <?php
-// manage_payments.php (FIXED)
-// Improvements:
-// 1. Manual cash payment now applies to existing unpaid (pending / partial / overdue) invoice for the selected stall/lease,
-//    updating that payment row (status, amount_paid, receipt_number) instead of creating a duplicate row.
-// 2. If the entered amount exceeds the remaining balance, it is capped to the remaining (with note).
-// 3. Only stalls with at least one unpaid invoice appear in the manual cash payment stall dropdown.
-// 4. After successful manual payment the unpaid invoice is cleared (or partially reduced) and no orphan pending row remains.
-// 5. Removed manual cash payment form from Payments tab (only allowed in Vendor Lookup tab).
-// 6. Added sort filter (already present) preserved.
-// 7. Fixed stretched "Create Manual Cash Payment" container by constraining width and preventing full-height stretching.
-// 8. Prevent selecting fully paid stalls (filter logic + safety check).
-// 9. Added robust receipt uniqueness and proper date handling.
-// 10. Ensures payment_date formatting does not produce year -0001 (null handling).
+// manage_payments.php (FULL FIX with toaster + manual cash application to existing unpaid invoice)
+// - Manual cash payments are ONLY allowed in Vendor Lookup tab.
+// - Payments tab has no manual cash actions and includes a sort filter.
+// - Manual cash applies to the oldest unpaid invoice (pending/partial/overdue) for the selected stall/lease.
+// - Capped to remaining balance if entered amount > remaining.
+// - Only stalls with unpaid invoices are shown in the manual cash form.
+// - Fixes layout so the manual cash card isn't stretched.
+// - Adds toast notifications for $success and $errors.
+// - Avoids invalid date formatting for empty payment_date by showing "—".
 
 require_once 'config.php';
 require_once 'includes/auth_roles.php';
@@ -139,7 +135,7 @@ try {
 $vendor_lookup_id   = isset($_GET['lookup_vendor']) ? (int)$_GET['lookup_vendor'] : (isset($_GET['lookup_vendor_select']) ? (int)$_GET['lookup_vendor_select'] : 0);
 $vendor_search_text = isset($_GET['lookup_search']) ? sanitize($_GET['lookup_search']) : '';
 
-/* ---------- Manual cash payment (APPLY TO EXISTING INVOICE) ---------- */
+/* ---------- Manual cash payment (apply to existing unpaid invoice) ---------- */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment'])) {
     if (!csrf_validate_request()) {
         $errors[] = 'Invalid CSRF token.';
@@ -151,16 +147,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
         $manual_notes     = sanitize($_POST['notes'] ?? '');
         $redirect_to      = $_POST['from_page'] ?? 'manage_payments.php?tab=vendor&lookup_vendor='.$manual_vendor_id;
 
-        if ($manual_vendor_id <= 0 || $manual_stall_id <= 0) {
-            $errors[] = 'Vendor and stall are required.';
-        }
-        if ($manual_amount <= 0) {
-            $errors[] = 'Amount must be greater than zero.';
-        }
-        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $manual_date)) {
-            $errors[] = 'Invalid payment date.';
-        }
-        // Scope check (stall belongs to user-scoped markets)
+        if ($manual_vendor_id <= 0 || $manual_stall_id <= 0) $errors[] = 'Vendor and stall are required.';
+        if ($manual_amount <= 0) $errors[] = 'Amount must be greater than zero.';
+        if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $manual_date)) $errors[] = 'Invalid payment date.';
+
+        // Scope check
         if (empty($errors) && $is_scoped_user && !empty($user_scoped_market_ids)) {
             $stallMarketRow = $db->fetch("SELECT market_id FROM stalls WHERE stall_id=? LIMIT 1", [$manual_stall_id]);
             $stMarketId = (int)($stallMarketRow['market_id'] ?? 0);
@@ -171,7 +162,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
 
         if (empty($errors)) {
             try {
-                // Find active lease for vendor & stall
+                // Find active lease
                 $leaseRow = $db->fetch("
                     SELECT l.lease_id, l.monthly_rent, l.vendor_id
                     FROM leases l
@@ -184,7 +175,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
                 } else {
                     $lease_id = (int)$leaseRow['lease_id'];
 
-                    // Fetch earliest unpaid (pending/partial/overdue) invoice/payment
+                    // Find earliest unpaid invoice
                     $unpaidPayment = $db->fetch("
                         SELECT * FROM payments
                         WHERE lease_id=? AND status IN ('pending','partial','overdue')
@@ -197,23 +188,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
                     $db->beginTransaction();
 
                     if ($unpaidPayment) {
-                        // Apply manual payment to existing unpaid invoice
                         $payment_id    = (int)$unpaidPayment['payment_id'];
                         $invoice_amount= (float)$unpaidPayment['amount'];
                         $already_paid  = $hasAmountPaidCol ? (float)$unpaidPayment['amount_paid'] : 0.0;
                         $remaining     = max(0.0, round($invoice_amount - $already_paid, 2));
-
-                        // Cap manual amount to remaining
                         $applied_amount = min($manual_amount, $remaining);
                         $new_paid_total = $already_paid + $applied_amount;
                         $epsilon = 0.00001;
                         $new_status = ($new_paid_total + $epsilon >= $invoice_amount) ? 'paid' : 'partial';
-
                         $receipt_number = $unpaidPayment['receipt_number'] ?: generate_receipt_number($db, date('Ymd', strtotime($manual_date)));
 
-                        // If user entered more than remaining, add a note
                         if ($manual_amount > $remaining) {
-                            $manual_notes .= ($manual_notes ? ' ' : '') . '[Amount capped to remaining balance '.$remaining.']';
+                            $manual_notes .= ($manual_notes ? ' ' : '') . '[Amount capped to remaining balance '.number_format($remaining, 2).']';
                         }
 
                         $updateSql = "
@@ -224,7 +210,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
                                    receipt_number=?,
                                    notes=CONCAT(COALESCE(notes,''), '\n[Manual Cash] ', ?),
                                    updated_at=NOW()
-                             ";
+                        ";
                         $updateVals = [$manual_date, $new_status, $receipt_number, $manual_notes];
 
                         if ($hasAmountPaidCol) {
@@ -242,17 +228,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
                         logAudit($db, $uid, 'Manual Cash Applied', 'payments', $payment_id, null,
                                  "applied={$applied_amount}; status={$new_status}");
 
-                        // Success message
                         $success = ($new_status === 'paid')
                             ? 'Manual payment recorded and invoice marked Paid.'
                             : 'Manual payment recorded as partial. Remaining balance updated.';
 
                     } else {
-                        // No unpaid invoice -> create a fresh payment record (rare fallback)
-                        // Use monthly_rent as baseline if amount equals monthly_rent else store entered amount.
+                        // No unpaid invoice exists (fallback new record)
                         $new_amount = $manual_amount;
-                        $due_date   = $manual_date; // You might adjust to configured invoice due day.
-                        $status     = 'paid'; // Direct paid since manual cash covers full amount of this ad-hoc invoice
+                        $due_date   = $manual_date;
+                        $status     = 'paid';
                         $receipt_number = generate_receipt_number($db, date('Ymd', strtotime($manual_date)));
 
                         $insertSql = "
@@ -282,7 +266,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
 
                     $db->commit();
 
-                    // Notification to vendor
                     if ($manual_vendor_id > 0 && function_exists('createNotification')) {
                         try {
                             createNotification(
@@ -295,10 +278,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_manual_payment
                                 null,
                                 'payments'
                             );
-                        } catch (Throwable $e) { /* ignore */ }
+                        } catch (Throwable $e) {}
                     }
 
-                    // Redirect back to vendor view
                     header('Location: manage_payments.php?tab=vendor&lookup_vendor='.$manual_vendor_id);
                     exit;
                 }
@@ -366,6 +348,79 @@ switch ($sort) {
 $sql .= " ORDER BY ".$sortOrder;
 
 try { $payments = $db->fetchAll($sql, $params) ?: []; } catch (Throwable $e) { error_log("manage_payments list fetch failed: ".$e->getMessage()); $payments = []; }
+
+/* ---------- CSV Export ---------- */
+if (isset($_GET['export']) && $_GET['export'] === 'csv') {
+    $export_sql = "
+        SELECT
+            p.receipt_number,
+            COALESCE(u.full_name,'-') AS vendor_name,
+            l.business_name,
+            s.stall_number,
+            m.market_name,
+            p.amount,
+            p.payment_method,
+            p.due_date,
+            p.payment_date,
+            p.status,
+            p.notes
+        FROM payments p
+        LEFT JOIN leases l ON p.lease_id = l.lease_id
+        LEFT JOIN stalls s ON l.stall_id = s.stall_id
+        LEFT JOIN markets m ON s.market_id = m.market_id
+        LEFT JOIN users u ON p.vendor_id = u.user_id
+        WHERE 1=1
+    ";
+    $export_params = [];
+    if ($status_filter !== 'all')           { $export_sql .= " AND p.status=?";         $export_params[] = $status_filter; }
+    if ($vendor_filter > 0)                 { $export_sql .= " AND p.vendor_id=?";      $export_params[] = $vendor_filter; }
+    if ($payment_method_filter !== 'all') {
+        if ($payment_method_filter === 'paypal') {
+            $export_sql .= " AND (p.payment_method='paypal' OR p.payment_method='online')";
+        } else {
+            $export_sql .= " AND p.payment_method=?";
+            $export_params[] = $payment_method_filter;
+        }
+    }
+    if ($date_from) { $export_sql .= " AND p.due_date >= ?"; $export_params[] = $date_from; }
+    if ($date_to)   { $export_sql .= " AND p.due_date <= ?"; $export_params[] = $date_to; }
+    if ($search) {
+        $export_sql .= " AND (l.business_name LIKE ? OR u.full_name LIKE ? OR s.stall_number LIKE ? OR p.receipt_number LIKE ?)";
+        $like = "%{$search}%";
+        $export_params = array_merge($export_params, [$like,$like,$like,$like]);
+    }
+    if ($is_scoped_user) {
+        if (!empty($user_scoped_market_ids)) {
+            $ph = implode(',', array_fill(0, count($user_scoped_market_ids), '?'));
+            $export_sql .= " AND s.market_id IN ($ph)";
+            $export_params = array_merge($export_params, $user_scoped_market_ids);
+        } else { $export_sql .= " AND 0=1"; }
+    }
+    $export_sql .= " ORDER BY ".$sortOrder;
+    try { $rows = $db->fetchAll($export_sql, $export_params) ?: []; } catch (Throwable $e) { $rows = []; }
+
+    header('Content-Type: text/csv; charset=utf-8');
+    header('Content-Disposition: attachment; filename="payments_export_'.date('Y-m-d_His').'.csv"');
+    $out = fopen('php://output','w');
+    fputcsv($out, ['Receipt Number','Vendor Name','Business Name','Stall Number','Market','Amount','Payment Method','Due Date','Paid Date','Status','Notes']);
+    foreach ($rows as $r) {
+        fputcsv($out, [
+            $r['receipt_number'] ?: '-',
+            $r['vendor_name'],
+            $r['business_name'],
+            $r['stall_number'],
+            $r['market_name'],
+            $r['amount'],
+            ucfirst(str_replace('_',' ',$r['payment_method'])),
+            $r['due_date'],
+            $r['payment_date'] ?: '—',
+            ucfirst($r['status']),
+            strip_tags($r['notes'] ?? '')
+        ]);
+    }
+    fclose($out);
+    exit;
+}
 
 /* ---------- Stats ---------- */
 $stats_sql = "
@@ -477,6 +532,23 @@ if ($active_tab === 'vendor') {
 include 'includes/header.php';
 include 'includes/admin_sidebar.php';
 
+// Toast CSS
+?>
+<style>
+  .toast-host { position: fixed; top: 16px; right: 16px; z-index: 9999; display: flex; flex-direction: column; gap: 10px; pointer-events: none; }
+  .toast { min-width: 260px; max-width: 380px; background: #1f2937; color: #fff; border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,0.16);
+           padding: 12px 14px; display: flex; align-items: flex-start; gap: 10px; pointer-events: auto; opacity: 0; transform: translateY(-8px);
+           transition: opacity 180ms ease, transform 180ms ease; border-left: 4px solid #3b82f6; font-size: 14px; line-height: 1.35; }
+  .toast.show { opacity: 1; transform: translateY(0); }
+  .toast.success { border-left-color: #10b981; }
+  .toast.error   { border-left-color: #ef4444; }
+  .toast.warn    { border-left-color: #f59e0b; }
+  .toast-info    { border-left-color: #3b82f6; }
+  .toast .toast-title { font-weight: 600; margin-bottom: 2px; }
+  .toast .toast-close { margin-left: auto; background: transparent; border: none; color: #fff; opacity: 0.8; cursor: pointer; font-size: 16px; line-height: 1; }
+  .toast .toast-close:hover { opacity: 1; }
+</style>
+<?php
 $preserve = [];
 foreach (['status','vendor','payment_method','date_from','date_to','search','sort'] as $k) {
     if (isset(${$k}) && ${$k} !== '' && ${$k} !== 'all' && ${$k} !== 0) $preserve[$k] = ${$k};
@@ -498,7 +570,7 @@ $vendor_tab_url   = 'manage_payments.php?'.http_build_query(array_merge($preserv
     </a>
   </div>
 
-  <!-- Messages -->
+  <!-- Messages (kept for accessibility; toasts will also show) -->
   <?php if ($errors): ?>
     <div class="mb-6 space-y-3">
       <?php foreach ($errors as $e): ?>
@@ -619,7 +691,7 @@ $vendor_tab_url   = 'manage_payments.php?'.http_build_query(array_merge($preserv
                   </td>
                   <td class="py-3 px-4 font-bold"><?= formatCurrency($p['amount']) ?></td>
                   <td class="py-3 px-4"><?= formatDate($p['due_date']) ?></td>
-                  <td class="py-3 px-4"><?= $p['payment_date'] ? formatDate($p['payment_date']) : '—' ?></td>
+                  <td class="py-3 px-4"><?= !empty($p['payment_date']) ? formatDate($p['payment_date']) : '—' ?></td>
                   <td class="py-3 px-4"><?= safe_html(ucfirst(str_replace('_',' ',$p['payment_method']))) ?></td>
                   <td class="py-3 px-4"><?= getStatusBadge($p['status']) ?></td>
                 </tr>
@@ -787,7 +859,7 @@ $vendor_tab_url   = 'manage_payments.php?'.http_build_query(array_merge($preserv
                         </td>
                         <td class="py-2 px-3 font-semibold"><?= formatCurrency($p['amount'] ?? 0) ?></td>
                         <td class="py-2 px-3"><?= formatDate($p['due_date'] ?? null) ?></td>
-                        <td class="py-2 px-3"><?= $p['payment_date'] ? formatDate($p['payment_date']) : '—' ?></td>
+                        <td class="py-2 px-3"><?= !empty($p['payment_date']) ? formatDate($p['payment_date']) : '—' ?></td>
                         <td class="py-2 px-3"><?= getStatusBadge($p['status'] ?? '') ?></td>
                       </tr>
                     <?php endforeach; ?>
@@ -800,7 +872,7 @@ $vendor_tab_url   = 'manage_payments.php?'.http_build_query(array_merge($preserv
           </div>
         </div>
 
-        <!-- Manual Cash Payment (not stretched) -->
+        <!-- Manual Cash Payment (not stretched; only eligible stalls) -->
         <div class="bg-gradient-to-br from-indigo-50 to-blue-50 p-6 rounded-lg shadow border border-indigo-200 self-start max-w-md w-full">
           <h5 class="font-semibold text-lg mb-2">Create Manual Cash Payment</h5>
           <p class="text-sm text-gray-600 mb-4">Apply a manual cash payment to the vendor's existing unpaid invoice.</p>
@@ -850,12 +922,53 @@ $vendor_tab_url   = 'manage_payments.php?'.http_build_query(array_merge($preserv
   <?php endif; ?>
 </div>
 
+<!-- Toast Container -->
+<div id="toastHost" class="toast-host" aria-live="polite" aria-atomic="true"></div>
+
 <script>
 function exportToCSV(){
   const url=new URL(window.location.href);
   url.searchParams.set('export','csv');
   window.location.href=url.toString();
 }
+(function(){
+  const host = document.getElementById('toastHost');
+  if (!host) return;
+
+  function escapeHtml(str) {
+    try { return String(str).replace(/[&<>"'`=\/]/g, s => map[s] || s); }
+    catch { return String(str); }
+  }
+  const map = {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;','/':'&#x2F;','`':'&#x60;','=':'&#x3D;'};
+
+  function showToast(message, opts = {}) {
+    const { title = '', type = 'info', duration = 3500, sticky = false } = opts;
+    const el = document.createElement('div');
+    el.className = `toast ${type === 'success' ? 'success' : type === 'error' ? 'error' : type === 'warn' ? 'warn' : 'toast-info'}`;
+    el.innerHTML = `
+      <div style="flex:1;">
+        ${title ? `<div class="toast-title">${escapeHtml(title)}</div>` : ''}
+        <div class="toast-body">${escapeHtml(message)}</div>
+      </div>
+      <button class="toast-close" aria-label="Close">&times;</button>
+    `;
+    const closeBtn = el.querySelector('.toast-close');
+    const remove = () => { el.classList.remove('show'); setTimeout(() => el.remove(), 180); };
+    closeBtn.addEventListener('click', remove);
+    host.appendChild(el);
+    requestAnimationFrame(() => el.classList.add('show'));
+    if (!sticky) setTimeout(remove, duration);
+    return el;
+  }
+  window.showToast = showToast;
+
+  <?php if (!empty($success)): ?>
+    showToast(<?php echo json_encode($success); ?>, { title: 'Success', type: 'success' });
+  <?php endif; ?>
+  <?php if (!empty($errors) && is_array($errors)): foreach ($errors as $e): ?>
+    showToast(<?php echo json_encode($e); ?>, { title: 'Error', type: 'error' });
+  <?php endforeach; endif; ?>
+})();
 </script>
 
 <?php include 'includes/footer.php'; ?>
