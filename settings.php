@@ -14,6 +14,9 @@ error_log("php now: " . date('Y-m-d H:i:s'));
  * - Avatar circle turns GREEN when the account has a vendor role, otherwise BLUE.
  * - Replaced the "Account" text badge with the user's primary role label.
  * - Permit/ID "Approved" badge color: GREEN for vendor, BLUE for market_manager/accountant/inspector/others.
+ * - UI state persistence: After initiating phone/email changes and sending/entering codes,
+ *   the Edit Profile section stays open and the appropriate verify form remains visible,
+ *   so the user can input the code without the panel auto-closing on page reload.
  */
 
 require_once 'config.php';
@@ -39,10 +42,11 @@ $password_success = '';
 $email_success    = '';
 $doc_success      = '';
 
-$show_phone_panel = false;
-$show_phone_verify = false;
-$show_email_panel = false;
-$show_email_verify = false;
+/* UI state flags (will be used to restore panels after POST) */
+$show_phone_panel   = false;
+$show_phone_verify  = false;
+$show_email_panel   = false;
+$show_email_verify  = false;
 $open_profile_section = false;
 
 $user_id = getCurrentUserId();
@@ -332,6 +336,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $profile_success .= 'Phone number updated successfully.';
                             logAudit($db, $user_id, 'Phone changed via verification', 'users', $user_id, null, $new_phone);
                             $user = $db->fetch("SELECT * FROM users WHERE user_id=? LIMIT 1", [$user_id]);
+                            // Keep the panel open briefly to show success, but hide verify form
+                            $show_phone_panel = true;
+                            $show_phone_verify = false;
+                            $open_profile_section = true;
                         }
                     }
                 } catch (Throwable $e) {
@@ -394,12 +402,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 send_email_change_confirmation($db, $user_id, $new_email, $email_code);
                                 $email_success = 'SMS delivery failed; a confirmation link/code was sent to the new email instead.';
                                 $show_email_panel = true;
+                                $show_email_verify = true;
                                 $open_profile_section = true;
                             }
                         } else {
                             send_email_change_confirmation($db, $user_id, $new_email, $email_code);
                             $email_success = 'Confirmation link/code sent to the new email address.';
                             $show_email_panel = true;
+                            $show_email_verify = true;
                             $open_profile_section = true;
                         }
                     }
@@ -468,6 +478,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             $email_success = 'Email updated successfully.';
                             logAudit($db, $user_id, 'Email changed via verification', 'users', $user_id, null, $new_email);
                             $user = $db->fetch("SELECT * FROM users WHERE user_id=? LIMIT 1", [$user_id]);
+                            // Keep section/panel open briefly; hide verify form
+                            $show_email_panel = true;
+                            $show_email_verify = false;
+                            $open_profile_section = true;
                         }
                     }
                 } catch (Throwable $e) {
@@ -486,6 +500,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['update_profile'])) {
     if (!csrf_validate_request()) {
         $errors[]='Invalid CSRF token.';
+        $open_profile_section = true;
     } else {
         $full_name   = sanitize($_POST['full_name'] ?? '');
         $email_input = sanitize($_POST['email'] ?? '');
@@ -562,6 +577,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['update_profile'])) {
                 $errors[]='Failed to update profile.';
             }
         }
+        $open_profile_section = true; // keep profile section open after saving
     }
 }
 
@@ -1180,6 +1196,54 @@ if (sendEmailCodeBtn) {
     postForm({initiate_email_change: '1', new_email: val});
   });
 }
+
+/* ---------------- UI State Restore (critical fix) ----------------
+   After POST (send code / verify code), the page reloads and would hide the profile section by default.
+   We restore the intended visibility so users can immediately input/see the code forms.
+*/
+(function restorePanels(){
+  const openProfile = <?php echo $open_profile_section ? 'true' : 'false'; ?>;
+  const showPhonePanel = <?php echo $show_phone_panel ? 'true' : 'false'; ?>;
+  const showPhoneVerify = <?php echo $show_phone_verify ? 'true' : 'false'; ?>;
+  const showEmailPanel = <?php echo $show_email_panel ? 'true' : 'false'; ?>;
+  const showEmailVerify = <?php echo $show_email_verify ? 'true' : 'false'; ?>;
+
+  if (openProfile) {
+    toggleSection('profileSection');
+    // Restore phone panel visibility
+    if (showPhonePanel && phonePanel) {
+      phonePanel.classList.remove('hidden');
+    }
+    if (!showPhonePanel && phonePanel) {
+      phonePanel.classList.add('hidden');
+    }
+    // Restore phone verify form visibility
+    if (verifyPhoneForm) {
+      if (showPhoneVerify) verifyPhoneForm.classList.remove('hidden');
+      else verifyPhoneForm.classList.add('hidden');
+    }
+    // Focus inputs appropriately
+    if (showPhonePanel && newPhoneInput) {
+      try { newPhoneInput.focus(); } catch(e){}
+    }
+
+    // Restore email panel visibility
+    if (showEmailPanel && emailPanel) {
+      emailPanel.classList.remove('hidden');
+    }
+    if (!showEmailPanel && emailPanel) {
+      emailPanel.classList.add('hidden');
+    }
+    // Restore email verify form visibility
+    if (verifyEmailForm) {
+      if (showEmailVerify) verifyEmailForm.classList.remove('hidden');
+      else verifyEmailForm.classList.add('hidden');
+    }
+    if (showEmailPanel && newEmailInput) {
+      try { newEmailInput.focus(); } catch(e){}
+    }
+  }
+})();
 </script>
 
 <?php include 'includes/footer.php'; ?>
