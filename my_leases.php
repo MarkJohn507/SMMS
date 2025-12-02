@@ -64,7 +64,7 @@ if ($tab === 'active') {
     foreach ($terminatedStatuses as $s) $params[] = $s;
 }
 
-// Fetch leases for this vendor and tab
+// Fetch leases for this vendor and tab, including balance computation
 try {
     $leases = $db->fetchAll(
         "SELECT 
@@ -78,15 +78,29 @@ try {
             (SELECT COUNT(*) 
                FROM payments p 
               WHERE p.lease_id = l.lease_id 
-                AND LOWER(TRIM(p.status)) IN ('pending','partial')
+                AND LOWER(TRIM(p.status)) IN ('pending','partial','overdue')
             ) AS pending_payments,
             (SELECT COUNT(*)
                FROM payments p
               WHERE p.lease_id = l.lease_id
-                AND LOWER(TRIM(p.status)) IN ('pending','partial')
+                AND LOWER(TRIM(p.status)) IN ('pending','partial','overdue')
                 AND CURDATE() > DATE(p.due_date)
                 AND CURDATE() <= DATE_ADD(DATE(p.due_date), INTERVAL {$graceDays} DAY)
-            ) AS in_grace_payments
+            ) AS in_grace_payments,
+            COALESCE((
+                SELECT SUM(
+                    CASE 
+                        WHEN p.amount IS NULL THEN 0
+                        WHEN (SELECT COUNT(*) FROM information_schema.columns 
+                              WHERE table_schema = DATABASE() AND table_name = 'payments' AND column_name = 'amount_paid') > 0
+                             THEN (p.amount - COALESCE(p.amount_paid, 0))
+                        ELSE p.amount
+                    END
+                )
+                FROM payments p
+                WHERE p.lease_id = l.lease_id
+                  AND LOWER(TRIM(p.status)) IN ('pending','partial','overdue')
+            ), 0) AS balance_amount
          FROM leases l
          JOIN stalls s ON l.stall_id = s.stall_id
          JOIN markets m ON s.market_id = m.market_id
@@ -141,6 +155,7 @@ function tabUrl(array $preserve, string $tab): string {
               <th class="py-3 px-4 text-left text-sm font-medium text-gray-700">Stall</th>
               <th class="py-3 px-4 text-left text-sm font-medium text-gray-700">Term</th>
               <th class="py-3 px-4 text-left text-sm font-medium text-gray-700">Rent</th>
+              <th class="py-3 px-4 text-left text-sm font-medium text-gray-700">Balance</th>
               <th class="py-3 px-4 text-left text-sm font-medium text-gray-700">Notes</th>
               <th class="py-3 px-4 text-left text-sm font-medium text-gray-700">Actions</th>
             </tr>
@@ -160,6 +175,7 @@ function tabUrl(array $preserve, string $tab): string {
                 $days_remaining     = isset($l['days_remaining']) ? (int)$l['days_remaining'] : null;
                 $pending_payments   = isset($l['pending_payments']) ? (int)$l['pending_payments'] : 0;
                 $in_grace_payments  = isset($l['in_grace_payments']) ? (int)$l['in_grace_payments'] : 0;
+                $balance_amount     = (float)($l['balance_amount'] ?? 0);
 
                 $notes = [];
                 if ($days_remaining !== null) {
@@ -192,7 +208,11 @@ function tabUrl(array $preserve, string $tab): string {
 
                 <td class="py-3 px-4 align-top"><?php echo $rent; ?></td>
 
-                <!-- Status cell removed -->
+                <td class="py-3 px-4 align-top">
+                  <span class="font-semibold <?php echo ($balance_amount > 0) ? 'text-red-600' : 'text-green-600'; ?>">
+                    <?php echo formatCurrency($balance_amount); ?>
+                  </span>
+                </td>
 
                 <td class="py-3 px-4 align-top"><?php echo $notes_html ?: '-'; ?></td>
 
@@ -201,8 +221,8 @@ function tabUrl(array $preserve, string $tab): string {
                     <a class="px-3 py-1 bg-blue-600 text-white rounded text-sm" href="lease_details.php?id=<?php echo $lease_id; ?>">View</a>
 
                     <?php if ($tab === 'active' && in_array($status_lc, $activeStatuses, true)): ?>
-                      <?php if ($pending_payments > 0): ?>
-                        <button class="px-3 py-1 bg-gray-300 text-gray-700 rounded text-sm cursor-not-allowed" title="Settle open invoices before requesting termination">Request Terminate</button>
+                      <?php if ($pending_payments > 0 || $balance_amount > 0): ?>
+                        <button class="px-3 py-1 bg-gray-300 text-gray-700 rounded text-sm cursor-not-allowed" title="Settle open invoices and balance before requesting termination">Request Terminate</button>
                       <?php else: ?>
                         <a class="px-3 py-1 bg-red-600 text-white rounded text-sm" href="request_termination.php?id=<?php echo $lease_id; ?>" onclick="return confirm('Are you sure you want to request termination of this lease?');">Request Terminate</a>
                       <?php endif; ?>

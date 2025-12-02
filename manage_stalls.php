@@ -695,7 +695,7 @@ require_once 'includes/admin_sidebar.php';
             <div>
               <label class="block text-sm mb-2">Status *</label>
               <select name="status" id="edit_status" class="w-full px-4 py-2 border rounded">
-                <option value="available">Available</option><option value="occupied">Occupied</option><option value="reserved">Reserved</option><option value="maintenance">Maintenance</option>
+                <option value="available">Available</option><option value="occupied">Occupied</option><option value="maintenance">Maintenance</option>
               </select>
               <p id="edit_status_hint" class="text-xs text-blue-700 mt-1 hidden">Active lease detected. "Available" is disabled.</p>
             </div>

@@ -466,7 +466,7 @@ require_once 'includes/admin_sidebar.php';
     <!-- Occupancy block -->
     <div class="bg-white rounded-lg shadow-md p-6">
         <h4 class="text-lg font-semibold mb-4">Stall Occupancy Overview</h4>
-        <div class="grid grid-cols-2 md:grid-cols-5 gap-4">
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
             <div class="text-center p-4 bg-gray-50 rounded-lg">
                 <p class="text-3xl font-bold"><?php echo (int)($occupancy['total_stalls'] ?? 0); ?></p>
                 <p class="text-sm text-gray-600">Total Stalls</p>
@@ -478,10 +478,6 @@ require_once 'includes/admin_sidebar.php';
             <div class="text-center p-4 bg-blue-50 rounded-lg">
                 <p class="text-3xl font-bold text-blue-600"><?php echo (int)($occupancy['occupied'] ?? 0); ?></p>
                 <p class="text-sm text-gray-600">Occupied</p>
-            </div>
-            <div class="text-center p-4 bg-yellow-50 rounded-lg">
-                <p class="text-3xl font-bold text-yellow-600"><?php echo (int)($occupancy['reserved'] ?? 0); ?></p>
-                <p class="text-sm text-gray-600">Reserved</p>
             </div>
             <div class="text-center p-4 bg-red-50 rounded-lg">
                 <p class="text-3xl font-bold text-red-600"><?php echo (int)($occupancy['maintenance'] ?? 0); ?></p>

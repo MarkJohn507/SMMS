@@ -349,7 +349,6 @@ require_once 'includes/admin_sidebar.php';
             }
 
             $isSuperAdminRole = ($roleKey === 'super_admin');
-            $showRevokeRole   = ($roleStatus==='active' && !$isSuperAdminRole);
           ?>
 
           <div class="border rounded-lg p-5">
@@ -402,18 +401,6 @@ require_once 'includes/admin_sidebar.php';
                   <div class="mt-2 text-xs bg-gray-50 border border-gray-200 text-gray-700 px-2 py-1 rounded whitespace-pre-line">
                     <strong>Admin notes:</strong> <?php echo h($ur['admin_notes']); ?>
                   </div>
-                <?php endif; ?>
-              </div>
-
-              <div class="flex flex-col items-end gap-2">
-                <?php if ($showRevokeRole): ?>
-                  <form method="POST" action="revoke_role.php" class="m-0" onsubmit="return confirm('Revoke this active role assignment?');">
-                    <?php echo csrf_field(); ?>
-                    <input type="hidden" name="user_role_id" value="<?php echo $roleId; ?>">
-                    <button type="submit" class="px-3 py-1 bg-yellow-500 hover:bg-yellow-600 text-white rounded text-xs" title="Revoke this role">Revoke Role</button>
-                  </form>
-                <?php elseif ($isSuperAdminRole): ?>
-                  <span class="text-[10px] text-gray-500 italic">Super Admin role cannot be revoked.</span>
                 <?php endif; ?>
               </div>
             </div>

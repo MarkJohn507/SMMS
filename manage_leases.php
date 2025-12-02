@@ -5,6 +5,7 @@ require_once 'includes/audit.php';
 require_once 'includes/csrf.php';
 require_once 'includes/notifications.php';
 require_once 'includes/inspector_utils.php';
+require_once 'includes/helpers.php'; // formatCurrency, formatDate
 
 if (session_status() !== PHP_SESSION_ACTIVE) session_start();
 
@@ -15,6 +16,7 @@ $success = '';
 $active_tab = isset($_GET['tab']) ? strtolower(trim($_GET['tab'])) : 'leases';
 if (!in_array($active_tab, ['leases','applications'], true)) $active_tab = 'leases';
 
+/* ------------------ Helpers ------------------ */
 function getManagedMarketIds($db, int $userId): array {
     $ids = [];
     try {
@@ -71,7 +73,7 @@ function ensure_can_manage_lease($db, ?int $leaseId = null, ?int $stallId = null
 if (!function_exists('formatCurrency')) { function formatCurrency($amount){ return '₱'.number_format((float)$amount,2); } }
 if (!function_exists('formatDate')) {
     function formatDate($date, $withTime=false){
-        if (!$date) return '-';
+        if (!$date || $date==='0000-00-00' || $date==='0000-00-00 00:00:00') return '-';
         $fmt = $withTime ? 'M j, Y g:i A' : 'M j, Y';
         $ts = strtotime($date);
         return $ts ? date($fmt, $ts) : '-';
@@ -79,27 +81,187 @@ if (!function_exists('formatDate')) {
 }
 if (!function_exists('getStatusBadge')) {
     function getStatusBadge($status){
-        $status=strtolower($status);
-        $map=['active'=>'bg-green-100 text-green-700','expired'=>'bg-yellow-100 text-yellow-700','terminated'=>'bg-red-100 text-red-700','pending'=>'bg-amber-100 text-amber-700'];
+        $status=strtolower(trim($status));
+        $map=[
+            'active'=>'bg-green-100 text-green-700',
+            'expired'=>'bg-yellow-100 text-yellow-700',
+            'terminated'=>'bg-red-100 text-red-700',
+            'pending'=>'bg-amber-100 text-amber-700',
+            'termination_requested'=>'bg-orange-100 text-orange-700'
+        ];
         $cls=$map[$status]??'bg-gray-100 text-gray-700';
         return "<span class='px-2 py-1 rounded text-xs font-semibold {$cls}'>".htmlspecialchars(ucwords(str_replace('_',' ',$status)))."</span>";
     }
 }
 
+/* Role flags */
 $uid = $_SESSION['user_id'] ?? null;
 $isMarketManager = false;
 try { if ($uid && function_exists('userIsInRole') && userIsInRole($db, $uid, 'market_manager')) $isMarketManager = true; } catch (Throwable $e) { error_log($e->getMessage()); }
 
-// ---------------- Actions: Terminate, Create Lease, Bulk Renew ----------------
+/* ---------------- Automatic renewal on page load ----------------
+   Behavior:
+   - On every page load, for active leases within the manager's scope (or admin scope), auto-renew by +1 month IF:
+     * The lease has at least one PAID invoice (proof of payments exist), AND
+     * The lease has NO unpaid invoices (no pending/partial/overdue), AND
+     * The lease end date is today or in the past (<= CURDATE()).
+   - Renewal creates a new monthly invoice (payments row) for the new period with status 'pending'.
+   - Amount used for the new invoice:
+     * If lease.monthly_rent is set, use it (this is the "modified new monthly rent").
+     * Otherwise, fallback to stall.monthly_rent as the default.
+   - Idempotency: Do not insert duplicate invoices for the same month. We check if a payments row already exists with due_date in the new month.
+*/
+function autoRenewEligibleLeases($db, int $actorUserId, ?array $scopeMarketIds = null) {
+    // Build scope filter
+    $scopeFilter = '';
+    $params = [];
+    if (!empty($scopeMarketIds)) {
+        $ph = implode(',', array_fill(0, count($scopeMarketIds), '?'));
+        $scopeFilter = " AND s.market_id IN ($ph) ";
+        $params = array_merge($params, $scopeMarketIds);
+    }
 
-// Terminate lease
+    // Find candidate active leases that should auto-renew now
+    $sql = "
+        SELECT l.lease_id, l.vendor_id, l.stall_id, l.monthly_rent, l.lease_end_date, l.lease_start_date,
+               s.monthly_rent AS stall_default_rent
+        FROM leases l
+        JOIN stalls s ON l.stall_id = s.stall_id
+        WHERE l.status='active'
+          {$scopeFilter}
+          AND (
+              l.lease_end_date IS NULL
+              OR l.lease_end_date='0000-00-00'
+              OR l.lease_end_date <= CURDATE()
+          )
+          AND EXISTS (
+              SELECT 1 FROM payments p
+              WHERE p.lease_id = l.lease_id
+                AND LOWER(TRIM(p.status))='paid'
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM payments p2
+              WHERE p2.lease_id = l.lease_id
+                AND LOWER(TRIM(p2.status)) IN ('pending','partial','overdue')
+          )
+        LIMIT 300
+    ";
+    $candidates = $db->fetchAll($sql, $params) ?: [];
+    if (!$candidates) return 0;
+
+    $renewed = 0;
+    foreach ($candidates as $cand) {
+        $leaseId   = (int)$cand['lease_id'];
+        $vendorId  = (int)$cand['vendor_id'];
+        $stallId   = (int)$cand['stall_id'];
+        $currEnd   = $cand['lease_end_date'];
+        $startDate = $cand['lease_start_date'];
+
+        $base = (!empty($currEnd) && $currEnd!=='0000-00-00') ? $currEnd
+               : ((!empty($startDate) && $startDate!=='0000-00-00') ? $startDate : date('Y-m-d'));
+        $newEnd = date('Y-m-d', strtotime($base.' +1 month'));
+
+        // Determine rent to charge for the new invoice
+        $rent = null;
+        if (isset($cand['monthly_rent']) && $cand['monthly_rent'] !== null && (float)$cand['monthly_rent'] > 0) {
+            $rent = (float)$cand['monthly_rent'];
+        } else {
+            $rent = (float)($cand['stall_default_rent'] ?? 0);
+        }
+        if ($rent <= 0) {
+            // Skip if we cannot determine a valid rent
+            continue;
+        }
+
+        try {
+            $db->beginTransaction();
+
+            // Lock lease row to avoid races
+            $lock = $db->fetch("SELECT lease_end_date FROM leases WHERE lease_id=? AND status='active' FOR UPDATE", [$leaseId]);
+            if (!$lock) { $db->rollBack(); continue; }
+
+            // Recompute newEnd from locked value
+            $lockedEnd = $lock['lease_end_date'];
+            $baseLocked = (!empty($lockedEnd) && $lockedEnd!=='0000-00-00') ? $lockedEnd : $base;
+            $newEnd = date('Y-m-d', strtotime($baseLocked.' +1 month'));
+
+            // Update lease end date
+            $okLease = $db->query("UPDATE leases SET lease_end_date=?, updated_at=NOW() WHERE lease_id=? AND status='active'", [$newEnd, $leaseId]);
+            if (!$okLease) { $db->rollBack(); continue; }
+
+            // Determine due date for the new invoice: set to newEnd (end of the renewed month)
+            $dueDate = $newEnd;
+
+            // Idempotency: check if there is already an invoice for this lease in the same year-month of dueDate
+            $ym = date('Y-m', strtotime($dueDate));
+            $exists = $db->fetch("
+                SELECT payment_id FROM payments
+                WHERE lease_id = ?
+                  AND DATE_FORMAT(due_date, '%Y-%m') = ?
+                LIMIT 1
+            ", [$leaseId, $ym]);
+
+            if (!$exists) {
+                // Insert new pending invoice
+                $okPay = $db->query("
+                    INSERT INTO payments
+                        (lease_id, vendor_id, amount, amount_paid, payment_date, due_date,
+                         payment_type, payment_method, status, receipt_number, notes, created_at, updated_at, currency)
+                    VALUES (?, ?, ?, 0, NULL, ?, 'rent', 'online', 'pending', NULL, '[Auto-renew invoice on page load]', NOW(), NOW(), 'PHP')
+                ", [$leaseId, $vendorId, number_format($rent, 2, '.', ''), $dueDate]);
+                if (!$okPay) { $db->rollBack(); continue; }
+            }
+
+            // Optional notification
+            if (function_exists('createNotification')) {
+                try {
+                    createNotification($db, $vendorId, 'Lease Auto-Renewed',
+                        "Your lease was auto-renewed. New end date: {$newEnd}. A new invoice has been generated for ".formatCurrency($rent).".",
+                        'info', 'lease', $leaseId, 'leases');
+                } catch (Throwable $e) { /* ignore */ }
+            }
+
+            logAudit($db, $actorUserId, 'Lease Auto-Renewed', 'leases', $leaseId, null, "new_end={$newEnd}, amount={$rent}");
+            $db->commit();
+            $renewed++;
+        } catch (Throwable $e) {
+            error_log("autoRenewEligibleLeases: ".$e->getMessage());
+            try { $db->rollBack(); } catch (Throwable $e2) {}
+        }
+    }
+    return $renewed;
+}
+
+/* Run auto-renew on page load (no cron), scoped to manager markets if applicable */
+try {
+    $scopeIds = null;
+    if ($isMarketManager) {
+        $scopeIds = getManagedMarketIds($db, (int)$uid);
+    }
+    $renewCount = autoRenewEligibleLeases($db, (int)$uid, $scopeIds);
+    if ($renewCount > 0) {
+        $success = "Auto-renewed {$renewCount} eligible lease(s) and generated monthly invoices.";
+    }
+} catch (Throwable $e) {
+    error_log("page-load auto renew failed: ".$e->getMessage());
+}
+
+/* ---------------- Actions: Terminate, Create Lease ---------------- */
+
+/* Terminate lease */
 if (isset($_GET['terminate']) && !empty($_GET['terminate'])) {
     $lease_id = (int)$_GET['terminate'];
     if ($lease_id <= 0) {
         $error = 'Invalid lease selected.';
     } else {
         ensure_can_manage_lease($db, $lease_id, null, null);
-        $lease = $db->fetch("SELECT l.*, s.stall_id, s.market_id, s.stall_number, l.vendor_id, (SELECT COUNT(*) FROM payments p WHERE p.lease_id = l.lease_id AND p.status IN ('pending','overdue','partial')) AS pending_payments FROM leases l JOIN stalls s ON l.stall_id = s.stall_id WHERE l.lease_id = ? LIMIT 1", [$lease_id]);
+        $lease = $db->fetch("
+            SELECT l.*, s.stall_id, s.market_id, s.stall_number, l.vendor_id,
+                   (SELECT COUNT(*) FROM payments p WHERE p.lease_id = l.lease_id AND LOWER(TRIM(p.status)) IN ('pending','overdue','partial')) AS pending_payments
+            FROM leases l
+            JOIN stalls s ON l.stall_id = s.stall_id
+            WHERE l.lease_id = ? LIMIT 1
+        ", [$lease_id]);
         if (!$lease) {
             $error = 'Lease not found.';
         } elseif (!empty($lease['pending_payments'])) {
@@ -123,7 +285,7 @@ if (isset($_GET['terminate']) && !empty($_GET['terminate'])) {
     }
 }
 
-// Create lease (converted from application)
+/* Create lease (converted from application) */
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_lease'])) {
     if (!csrf_validate_request()) {
         $error = 'Invalid CSRF token.';
@@ -140,7 +302,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_lease'])) {
         } elseif ($lease_end_date !== null && $lease_end_date !== '' && strtotime($lease_end_date) <= strtotime($lease_start_date)) {
             $error = 'Lease end date must be after start date.';
         } else {
-            $app = $db->fetch("SELECT a.*, s.stall_id, s.stall_number, s.market_id, s.monthly_rent AS stall_default_rent, u.user_id as vendor_id FROM applications a JOIN stalls s ON a.stall_id = s.stall_id JOIN users u ON a.vendor_id = u.user_id WHERE a.application_id = ? LIMIT 1", [$application_id]);
+            $app = $db->fetch("
+                SELECT a.*, s.stall_id, s.stall_number, s.market_id, s.monthly_rent AS stall_default_rent, u.user_id as vendor_id
+                FROM applications a
+                JOIN stalls s ON a.stall_id = s.stall_id
+                JOIN users u  ON a.vendor_id = u.user_id
+                WHERE a.application_id = ? LIMIT 1
+            ", [$application_id]);
             if (!$app) {
                 $error = 'Application not found.';
             } else {
@@ -205,54 +373,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['create_lease'])) {
     }
 }
 
-// Bulk renew all eligible (manual button)
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['renew_all_eligible'])) {
-    if (!csrf_validate_request()) {
-        $error = 'Invalid CSRF token.';
-    } else {
-        try {
-            $managedIds = getManagedMarketIds($db, $uid);
-            $renewed = 0; $skipped = 0;
-
-            $selSql = "SELECT l.lease_id, l.vendor_id
-                       FROM leases l
-                       JOIN stalls s ON l.stall_id = s.stall_id
-                       WHERE l.status='active'
-                         AND (l.lease_end_date IS NULL OR l.lease_end_date <= DATE_ADD(CURDATE(), INTERVAL 7 DAY))
-                         AND (SELECT COUNT(*) FROM payments p WHERE p.lease_id = l.lease_id AND p.status IN ('pending','overdue','partial')) = 0";
-            $params = [];
-            if ($isMarketManager && !empty($managedIds)) {
-                $ph = implode(',', array_fill(0, count($managedIds), '?'));
-                $selSql .= " AND s.market_id IN ($ph)";
-                $params = array_merge($params, $managedIds);
-            }
-
-            $candidates = $db->fetchAll($selSql." LIMIT 200", $params) ?: [];
-            foreach ($candidates as $cand) {
-                $lid = (int)$cand['lease_id'];
-                try {
-                    $ok = $db->query("UPDATE leases SET lease_end_date = DATE_ADD(lease_end_date, INTERVAL 1 MONTH), updated_at = NOW() WHERE lease_id = ? AND status='active'", [$lid]);
-                    if ($ok) {
-                        $renewed++;
-                        if (function_exists('createNotification')) {
-                            try {
-                                $row = $db->fetch("SELECT vendor_id, lease_end_date FROM leases WHERE lease_id=? LIMIT 1", [$lid]);
-                                $newEnd = $row['lease_end_date'] ?? '';
-                                createNotification($db, (int)$row['vendor_id'], 'Lease Renewed', "Your lease has been renewed by the market manager. New end date: {$newEnd}.", 'success', 'lease', $lid, 'leases');
-                            } catch (Throwable $e) {}
-                        }
-                        logAudit($db, $uid, 'Lease Bulk Renewed', 'leases', $lid, null, null);
-                    } else { $skipped++; }
-                } catch (Throwable $e) { $skipped++; }
-            }
-            $success = "Bulk renew complete: {$renewed} renewed, {$skipped} skipped.";
-        } catch (Throwable $e) {
-            error_log("bulk renew failed: ".$e->getMessage());
-            $error = 'Bulk renew failed.';
-        }
-    }
-}
-
 /* ---------- Stats / Filters / Queries ---------- */
 $uid = $_SESSION['user_id'] ?? null;
 $isMarketManager = $uid && function_exists('userIsInRole') && userIsInRole($db, $uid, 'market_manager');
@@ -300,25 +420,17 @@ $balance_filter  = isset($_GET['balance']) ? strtolower(trim(sanitize($_GET['bal
 $sort = isset($_GET['sort']) ? strtolower(trim(sanitize($_GET['sort']))) : '';
 $dir  = isset($_GET['dir']) ? strtolower(trim(sanitize($_GET['dir']))) : '';
 $allowedSorts = [
-    'start_desc',    // lease_start_date DESC
-    'start_asc',     // lease_start_date ASC
-    'end_desc',      // lease_end_date DESC
-    'end_asc',       // lease_end_date ASC
-    'rent_desc',     // monthly_rent DESC
-    'rent_asc',      // monthly_rent ASC
-    'balance_desc',  // balance_amount DESC
-    'balance_asc',   // balance_amount ASC
-    'vendor_asc',    // vendor_name ASC
-    'vendor_desc'    // vendor_name DESC
+    'start_desc', 'start_asc', 'end_desc', 'end_asc',
+    'rent_desc',  'rent_asc',  'balance_desc', 'balance_asc',
+    'vendor_asc', 'vendor_desc'
 ];
 if (!in_array($sort, $allowedSorts, true)) {
-    // Map dir+default to start date if provided
     if ($dir === 'asc') $sort = 'start_asc';
     elseif ($dir === 'desc') $sort = 'start_desc';
     else $sort = 'start_desc';
 }
 
-/* Applications list (unchanged) */
+/* Applications list */
 $proposal_search     = isset($_GET['proposal_search']) ? sanitize($_GET['proposal_search']) : '';
 $proposal_market_id  = isset($_GET['proposal_market_id']) ? (int)$_GET['proposal_market_id'] : 0;
 $proposal_stall_id   = isset($_GET['proposal_stall_id']) ? (int)$_GET['proposal_stall_id'] : 0;
@@ -372,8 +484,13 @@ try {
     $sql = "SELECT l.*, s.stall_number, s.stall_size, m.market_name, m.location,
                    u.full_name as vendor_name, u.email, u.contact_number,
                    DATEDIFF(l.lease_end_date, CURDATE()) as days_remaining,
-                   (SELECT COUNT(*) FROM payments WHERE lease_id = l.lease_id AND status IN ('pending','overdue','partial')) as pending_payments,
-                   COALESCE((SELECT SUM(amount - amount_paid) FROM payments WHERE lease_id = l.lease_id AND status IN ('pending','partial','overdue')), 0) AS balance_amount
+                   (SELECT COUNT(*) FROM payments WHERE lease_id = l.lease_id AND LOWER(TRIM(status)) IN ('pending','overdue','partial')) as pending_payments,
+                   COALESCE((
+                       SELECT SUM((p.amount - COALESCE(p.amount_paid,0)))
+                       FROM payments p
+                       WHERE p.lease_id = l.lease_id
+                         AND LOWER(TRIM(p.status)) IN ('pending','partial','overdue')
+                   ), 0) AS balance_amount
             FROM leases l
             JOIN stalls s ON l.stall_id = s.stall_id
             JOIN markets m ON s.market_id = m.market_id
@@ -434,15 +551,9 @@ include 'includes/admin_sidebar.php';
 <div class="mb-6 flex justify-between items-center">
     <div>
         <p class="text-gray-600">View and manage all lease agreements</p>
+        <p class="text-xs text-gray-500">Auto-renew runs on page load: active leases without unpaid invoices and with prior payments are extended by one month and invoiced.</p>
     </div>
-    <div class="flex items-center gap-2">
-        <form method="POST" onsubmit="return confirm('Renew all eligible active leases (no pending/overdue payments) by +1 month?');">
-            <?php echo csrf_field(); ?>
-            <button type="submit" name="renew_all_eligible" class="px-4 py-2 bg-indigo-600 text-white rounded hover:bg-indigo-700">
-                Renew all eligible
-            </button>
-        </form>
-    </div>
+    <!-- Renew button removed -->
 </div>
 
 <?php if (!empty($_SESSION['flash_success'])): ?>
@@ -486,7 +597,7 @@ include 'includes/admin_sidebar.php';
   </div>
 </div>
 
-<!-- Applications tab (unchanged UI) -->
+<!-- Applications tab -->
 <div id="tab-applications" class="mb-6 <?php echo $active_tab === 'applications' ? '' : 'hidden'; ?>">
     <div class="bg-white rounded-lg shadow-md p-6 mb-6">
         <div class="flex items-center justify-between mb-4">
@@ -498,10 +609,13 @@ include 'includes/admin_sidebar.php';
                 <input type="hidden" name="tab" value="applications">
                 <select name="proposal_market_id" class="px-3 py-2 border rounded-md" onchange="this.form.submit()">
                     <option value="0">All Markets</option>
-                    <?php foreach ($markets as $mk): ?>
-                        <option value="<?php echo (int)$mk['market_id']; ?>" <?php echo $proposal_market_id===(int)$mk['market_id']?'selected':''; ?>>
-                            <?php echo htmlspecialchars($mk['market_name']); ?>
-                        </option>
+                    <?php
+                      $markets = $db->fetchAll("SELECT market_id, market_name FROM markets ORDER BY market_name") ?: [];
+                      foreach ($markets as $mk):
+                    ?>
+                      <option value="<?php echo (int)$mk['market_id']; ?>" <?php echo ($proposal_market_id??0)===(int)$mk['market_id']?'selected':''; ?>>
+                        <?php echo htmlspecialchars($mk['market_name']); ?>
+                      </option>
                     <?php endforeach; ?>
                 </select>
                 <select name="proposal_stall_id" class="px-3 py-2 border rounded-md" <?php echo $proposal_market_id>0?'':'disabled'; ?> onchange="this.form.submit()">
@@ -656,16 +770,21 @@ include 'includes/admin_sidebar.php';
                                 <td class="py-4 px-6">
                                     <p class="text-sm text-gray-800"><?php echo formatDate($lease['lease_start_date']); ?></p>
                                     <p class="text-sm text-gray-800">to <?php echo formatDate($lease['lease_end_date']); ?></p>
-                                    <?php if ($lease['status'] === 'active'): ?>
+                                    <?php if (strtolower($lease['status']) === 'active'): ?>
                                         <?php if ((int)$lease['days_remaining'] < 0): ?>
                                             <span class="text-xs text-red-600 font-semibold">⚠️ Expired</span>
                                         <?php elseif ((int)$lease['days_remaining'] <= 30): ?>
-                                            <span class="text-xs text-orange-600 font-semibold">⏰ <?php echo (int)$lease['days_remaining']; ?> days left</span>
+                                            <span class="text-xs text-orange-600 font-semibold">⏰ <?php echo (int)$lease['days_remaining']; ?> day<?php echo (int)$lease['days_remaining']===1?'':'s'; ?> left</span>
                                         <?php endif; ?>
                                     <?php endif; ?>
                                 </td>
                                 <td class="py-4 px-6">
-                                    <p class="font-semibold text-gray-800"><?php echo formatCurrency($lease['monthly_rent']); ?></p>
+                                    <p class="font-semibold text-gray-800">
+                                        <?php
+                                          $rentShow = ($lease['monthly_rent'] !== null && $lease['monthly_rent'] !== '') ? (float)$lease['monthly_rent'] : 0.0;
+                                          echo formatCurrency($rentShow);
+                                        ?>
+                                    </p>
                                 </td>
                                 <td class="py-4 px-6">
                                     <?php $bal = (float)($lease['balance_amount'] ?? 0); ?>
@@ -678,13 +797,12 @@ include 'includes/admin_sidebar.php';
                                 </td>
                                 <td class="py-4 px-6">
                                     <div class="flex flex-wrap gap-2">
-                                        <?php if ($lease['status'] === 'active'): ?>
-                                            <button onclick='openRenewModal(<?php echo json_encode($lease, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT); ?>)' class="bg-blue-600 text-white px-3 py-1 rounded hover:bg-blue-700 text-sm">Renew</button>
-                                            <button onclick='openModifyModal(<?php echo json_encode($lease, JSON_HEX_TAG|JSON_HEX_APOS|JSON_HEX_QUOT); ?>)' class="bg-purple-600 text-white px-3 py-1 rounded hover:bg-purple-700 text-sm">Modify</button>
-                                            <?php if (!($isMarketManager && (int)$lease['pending_payments'] === 0)): ?>
-                                                <button onclick="confirmTerminate(<?php echo (int)$lease['lease_id']; ?>, '<?php echo htmlspecialchars($lease['business_name']); ?>', <?php echo (int)$lease['pending_payments']; ?>)" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700 text-sm">Terminate</button>
+                                        <?php if (strtolower($lease['status']) === 'active'): ?>
+                                            <!-- Renew button removed to avoid manual renew -->
+                                            <?php if ((int)$lease['pending_payments'] > 0): ?>
+                                                <button class="bg-gray-300 text-gray-700 px-3 py-1 rounded text-sm cursor-not-allowed" title="Settle open invoices before termination">Terminate</button>
                                             <?php else: ?>
-                                                <span class="text-xs text-gray-500 px-2 py-1 rounded border border-gray-300">Termination disabled (paid)</span>
+                                                <button onclick="confirmTerminate(<?php echo (int)$lease['lease_id']; ?>, '<?php echo htmlspecialchars($lease['business_name']); ?>', <?php echo (int)$lease['pending_payments']; ?>)" class="bg-red-600 text-white px-3 py-1 rounded hover:bg-red-700 text-sm">Terminate</button>
                                             <?php endif; ?>
                                         <?php else: ?>
                                             <span class="text-gray-500 text-sm">No action</span>
@@ -699,7 +817,7 @@ include 'includes/admin_sidebar.php';
         <?php else: ?>
             <div class="text-center py-16">
                 <h3 class="text-xl font-semibold text-gray-700 mb-2">No leases found</h3>
-                <p class="text-gray-500">Leases will appear here when created from pending applications</p>
+                <p class="text-gray-500">Leases will appear here when created from pending applications.</p>
             </div>
         <?php endif; ?>
     </div>
@@ -748,70 +866,6 @@ include 'includes/admin_sidebar.php';
     </div>
 </div>
 
-<!-- Renew Lease Modal (fixed to monthly; read-only date) -->
-<div id="renewModal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
-  <div class="bg-white rounded-lg max-w-lg w-full overflow-y-auto">
-    <div class="p-6">
-      <div class="flex items-center justify-between mb-4">
-        <h3 class="text-2xl font-bold text-gray-800">Renew Lease</h3>
-        <button type="button" onclick="closeRenewModal()" class="text-gray-500 hover:text-gray-700">✕</button>
-      </div>
-
-      <form method="POST" action="">
-        <?php echo csrf_field(); ?>
-        <input type="hidden" name="renew_lease_id" id="renew_lease_id">
-
-        <div class="mb-4"><p class="text-sm text-gray-600">Business</p><div id="renew_business_name" class="font-medium text-gray-800"></div></div>
-        <div class="mb-4"><p class="text-sm text-gray-600">Current End Date</p><div id="renew_current_end" class="font-medium text-gray-800"></div></div>
-        <div class="mb-4"><p class="text-sm text-gray-600">Current Monthly Rent</p><div id="renew_monthly_rent" class="font-medium text-gray-800"></div></div>
-
-        <div class="mb-2">
-          <label class="block text-sm text-gray-700 mb-1">New End Date (fixed to +1 month)</label>
-          <input type="date" name="renew_new_end_date" id="renew_new_end_date" readonly aria-readonly="true" class="w-full px-4 py-2 border rounded bg-gray-100 opacity-80 cursor-not-allowed" />
-        </div>
-        <p class="text-xs text-gray-500 mb-4">Renewals are monthly and the date above is pre-set to one month after the current end date. Review and confirm to proceed.</p>
-
-        <div class="flex gap-3">
-          <button type="submit" name="renew_lease" class="bg-blue-600 text-white px-4 py-2 rounded">Confirm Renewal</button>
-          <button type="button" onclick="closeRenewModal()" class="bg-gray-300 text-gray-700 px-4 py-2 rounded">Cancel</button>
-        </div>
-      </form>
-    </div>
-  </div>
-</div>
-
-<!-- Modify Lease Modal (note about when rent takes effect) -->
-<div id="modifyModal" class="hidden fixed inset-0 bg-black bg-opacity-50 z-50 flex items-center justify-center p-4">
-  <div class="bg-white rounded-lg max-w-lg w-full overflow-y-auto">
-    <div class="p-6">
-      <div class="flex items-center justify_between mb-4">
-        <h3 class="text-2xl font-bold text-gray-800">Modify Lease</h3>
-        <button type="button" onclick="closeModifyModal()" class="text-gray-500 hover:text-gray-700">✕</button>
-      </div>
-
-      <form method="POST" action="">
-        <?php echo csrf_field(); ?>
-        <input type="hidden" name="modify_lease_id" id="modify_lease_id">
-
-        <div class="mb-4"><p class="text-sm text-gray-600">Business</p><div id="modify_business_name" class="font-medium text-gray-800"></div></div>
-        <div class="mb-4"><p class="text-sm text-gray-600">Vendor</p><div id="modify_vendor_name" class="font-medium text-gray-800"></div></div>
-        <div class="mb-4"><p class="text-sm text-gray-600">Current Monthly Rent</p><div id="modify_current_rent" class="font-medium text-gray-800"></div></div>
-
-        <div class="mb-1">
-          <label class="block text-sm text-gray-700 mb-2">New Monthly Rent *</label>
-          <input type="number" name="modify_new_rent" id="modify_new_rent" step="0.01" required class="w-full px-4 py-2 border rounded" />
-        </div>
-        <p class="text-xs text-gray-500 mb-4">The new monthly rent will take effect at the end of the current lease term and be applied upon renewal.</p>
-
-        <div class="flex gap-3">
-          <button type="submit" name="modify_lease" class="bg-purple-600 text-white px-4 py-2 rounded">Save Changes</button>
-          <button type="button" onclick="closeModifyModal()" class="bg-gray-300 text-gray-700 px-4 py-2 rounded">Cancel</button>
-        </div>
-      </form>
-    </div>
-  </div>
-</div>
-
 </section>
 
 <script>
@@ -841,60 +895,7 @@ function openCreateLeaseModal(app) {
 }
 function closeCreateLeaseModal() {
     const modal = document.getElementById('createLeaseModal'); if (modal) modal.classList.add('hidden');
-    ['create_lease_start_date','create_lease_end_date','create_monthly_rent'].forEach(id=>{
-        const el=document.getElementById(id); if(!el) return;
-        el.removeAttribute('readonly'); el.removeAttribute('aria-readonly'); el.classList.remove('bg-gray-100','opacity-80');
-    });
 }
-
-function openRenewModal(lease) {
-    try { if (typeof lease === 'string') lease = JSON.parse(lease); } catch(e) { lease = lease || {}; }
-    const idEl = document.getElementById('renew_lease_id');
-    const businessEl = document.getElementById('renew_business_name');
-    const currentEndEl = document.getElementById('renew_current_end');
-    const monthlyRentEl = document.getElementById('renew_monthly_rent');
-    const newEndEl = document.getElementById('renew_new_end_date');
-    const modal = document.getElementById('renewModal');
-    if (!modal) return;
-    if (idEl && lease.lease_id !== undefined) idEl.value = lease.lease_id;
-    if (businessEl) businessEl.textContent = lease.business_name ?? '';
-    if (currentEndEl) currentEndEl.textContent = lease.lease_end_date ?? '';
-    if (monthlyRentEl) {
-        try { monthlyRentEl.textContent = '₱' + parseFloat(lease.monthly_rent).toLocaleString('en-PH', {minimumFractionDigits: 2}); }
-        catch (e) { monthlyRentEl.textContent = lease.monthly_rent ?? ''; }
-    }
-    if (newEndEl) {
-        let base = lease.lease_end_date ? new Date(lease.lease_end_date) : new Date();
-        const defaultEnd = new Date(base); defaultEnd.setMonth(defaultEnd.getMonth()+1);
-        newEndEl.value = defaultEnd.toISOString().split('T')[0];
-        newEndEl.readOnly = true;
-        newEndEl.setAttribute('aria-readonly','true');
-        newEndEl.classList.add('bg-gray-100','opacity-80','cursor-not-allowed');
-    }
-    modal.classList.remove('hidden');
-}
-function closeRenewModal(){ const el=document.getElementById('renewModal'); if(el) el.classList.add('hidden'); const ne=document.getElementById('renew_new_end_date'); if(ne) ne.value=''; const id=document.getElementById('renew_lease_id'); if(id) id.value=''; }
-
-function openModifyModal(lease) {
-    try { if (typeof lease === 'string') lease = JSON.parse(lease); } catch(e) { lease = lease || {}; }
-    const idEl = document.getElementById('modify_lease_id');
-    const businessEl = document.getElementById('modify_business_name');
-    const vendorEl = document.getElementById('modify_vendor_name');
-    const currentRentEl = document.getElementById('modify_current_rent');
-    const newRentEl = document.getElementById('modify_new_rent');
-    const modal = document.getElementById('modifyModal');
-    if (!modal) return;
-    if (idEl && lease.lease_id !== undefined) idEl.value = lease.lease_id;
-    if (businessEl) businessEl.textContent = lease.business_name ?? '';
-    if (vendorEl) vendorEl.textContent = lease.vendor_name ?? '';
-    if (currentRentEl) {
-        try { currentRentEl.textContent = '₱' + parseFloat(lease.monthly_rent).toLocaleString('en-PH', {minimumFractionDigits: 2}); }
-        catch (e) { currentRentEl.textContent = lease.monthly_rent ?? ''; }
-    }
-    if (newRentEl) newRentEl.value = lease.monthly_rent ?? '';
-    modal.classList.remove('hidden');
-}
-function closeModifyModal(){ const el=document.getElementById('modifyModal'); if(el) el.classList.add('hidden'); const id=document.getElementById('modify_lease_id'); if(id) id.value=''; const nr=document.getElementById('modify_new_rent'); if(nr) nr.value=''; }
 
 function confirmTerminate(leaseId, businessName, pendingPayments) {
     if (pendingPayments > 0) { alert('Cannot terminate lease: ' + pendingPayments + ' pending/overdue payment(s) must be settled first.'); return; }
@@ -903,18 +904,17 @@ function confirmTerminate(leaseId, businessName, pendingPayments) {
     }
 }
 
+/* Escape to close modals */
 document.addEventListener('keydown', function(e) {
     if (e.key === 'Escape') {
-        closeCreateLeaseModal(); closeRenewModal(); closeModifyModal();
+        closeCreateLeaseModal();
     }
 });
-['createLeaseModal','renewModal','modifyModal'].forEach(modalId => {
+['createLeaseModal'].forEach(modalId => {
     const el = document.getElementById(modalId); if (!el) return;
     el.addEventListener('click', function(e) {
         if (e.target === this) {
             if (modalId==='createLeaseModal') closeCreateLeaseModal();
-            if (modalId==='renewModal') closeRenewModal();
-            if (modalId==='modifyModal') closeModifyModal();
         }
     });
 });

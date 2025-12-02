@@ -4,6 +4,7 @@
  * Dedicated receipt page shown after successful PayPal capture.
  * Robust display with optional amount_paid and latest capture info.
  * Also adds print styles to hide action buttons (Back/Print) when printing.
+ * Restricts viewing: Vendors can only view receipts for PAID payments.
  */
 
 require_once 'config.php';
@@ -46,6 +47,7 @@ if ($pid <= 0) { http_response_code(400); echo "Invalid receipt."; exit; }
 
 $hasAmountPaid = db_col_exists($db, 'payments', 'amount_paid');
 
+// Load payment row
 try {
     if ($hasAmountPaid) {
         $row = $db->fetch("
@@ -85,8 +87,16 @@ try {
 
 if (!$row) { http_response_code(404); echo "Receipt not found."; exit; }
 
-// Scope check
+// Scope check: vendor must own the lease/payment
 if ($isVendor && (int)$row['vendor_id'] !== $user_id) { http_response_code(403); echo "Forbidden"; exit; }
+
+// Restrict viewing for vendors: only when payment is PAID
+$status_lc = strtolower((string)$row['status']);
+if ($isVendor && $status_lc !== 'paid') {
+    http_response_code(403);
+    echo "Receipt is available only for paid payments.";
+    exit;
+}
 
 $total_due    = (float)($row['amount'] ?? 0);
 $paid_to_date = $hasAmountPaid ? (float)($row['amount_paid'] ?? 0) : (strtolower((string)$row['status']) === 'paid' ? $total_due : 0.0);
@@ -129,9 +139,7 @@ else require_once 'includes/admin_sidebar.php';
 <style>
 @media print {
   .no-print, .print\:hidden { display: none !important; }
-  /* Optional: remove link URLs in some browsers */
   a[href]:after { content: "" !important; }
-  /* Optional: tighten margins on print */
   body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
 }
 </style>
