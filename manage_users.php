@@ -8,6 +8,10 @@
  * - Orders role documents by known columns present in the schema to avoid "Unknown column" SQL errors.
  * - Approve/Reject forms send both user_role_document_id and identity_id so handlers can choose.
  * - Restores account activate/deactivate toggle, visible only to super_admins.
+ *
+ * Fix: Do not show the Approve button for documents that are already rejected.
+ * Previously, canApproveDoc allowed ['pending','rejected'], which let admins approve
+ * a rejected document without any resubmission. We now allow Approve ONLY when status is 'pending'.
  */
 
 require_once 'config.php';
@@ -164,8 +168,6 @@ if ($user_roles) {
         if ($roleIds) {
             $ph = implode(',', array_fill(0, count($roleIds), '?'));
 
-            // ORDER BY only references known columns present in your schema:
-            // user_role_document_id (PK) then uploaded_at or reviewed_at.
             $docRows = $db->fetchAll(
                 "SELECT d.* FROM user_role_documents d
                  WHERE d.user_role_id IN ($ph)
@@ -447,8 +449,11 @@ require_once 'includes/admin_sidebar.php';
                           $docIsRequired = in_array(strtolower($docType), $requiredNorm, true);
                           $docLocked = (!$isSuperAdminRole && $roleStatus === 'active' && $docIsRequired && $docStatus === 'approved');
 
-                          $canApproveDoc = !$isSuperAdminRole && !$docLocked && in_array($docStatus, ['pending','rejected'], true);
-                          $canRejectDoc  = !$isSuperAdminRole && !$docLocked && in_array($docStatus, ['pending'], true);
+                          // FIX: Only allow Approve when status is 'pending' (not 'rejected')
+                          $canApproveDoc = (!$isSuperAdminRole && !$docLocked && $docStatus === 'pending');
+
+                          // Reject allowed only when pending (no action on already approved/rejected)
+                          $canRejectDoc  = (!$isSuperAdminRole && !$docLocked && $docStatus === 'pending');
 
                           $roleDocId = (int)($dr['user_role_document_id'] ?? 0);
                           $identityId = (int)($dr['identity_id'] ?? 0);

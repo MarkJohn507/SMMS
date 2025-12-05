@@ -7,6 +7,8 @@
  * - Excludes super_admin and vendor roles.
  * - Batch-resolves assigned_by -> requester name and market_id -> market manager name.
  * - Defensive against schemas that may not have optional columns.
+ *
+ * Update: Removed "Revoke" action/button from processed requests.
  */
 
 require_once 'config.php';
@@ -30,7 +32,6 @@ $success = '';
 if (!empty($_GET['msg'])) {
     if ($_GET['msg'] === 'approved') $success = 'Role request approved.';
     elseif ($_GET['msg'] === 'rejected') $success = 'Role request rejected.';
-    elseif ($_GET['msg'] === 'revoked') $success = 'Role revoked.';
 }
 if (!empty($_GET['error'])) $errors[] = 'An error occurred processing the request.';
 
@@ -343,7 +344,6 @@ require_once 'includes/admin_sidebar.php';
             };
             $canReviewApprove = in_array($cleanStatus, ['under_review','pending','provisional_active','rejected'], true);
             $canReject        = in_array($cleanStatus, ['under_review','rejected','provisional_active'], true);
-            $canRevoke        = ($cleanStatus === 'active');
 
             $requestedBy = $r['requested_by_name'] ?? '';
           ?>
@@ -401,16 +401,6 @@ require_once 'includes/admin_sidebar.php';
                             data-user-name="<?php echo htmlspecialchars($r['full_name'] ?? $r['username'], ENT_QUOTES); ?>"
                             data-role-name="<?php echo htmlspecialchars($r['role_name'], ENT_QUOTES); ?>"
                             onclick="openRejectModal(this)">Reject</button>
-                  <?php endif; ?>
-
-                  <?php if ($canRevoke): ?>
-                    <form method="POST" action="revoke_role.php"
-                          onsubmit="return confirm('Revoke this role?');"
-                          class="m-0">
-                      <?php echo csrf_field(); ?>
-                      <input type="hidden" name="user_role_id" value="<?php echo (int)$r['user_role_id']; ?>">
-                      <button class="px-3 py-1 bg-yellow-500 hover:bg-yellow-600 text-white rounded">Revoke</button>
-                    </form>
                   <?php endif; ?>
                 </div>
               </div>
